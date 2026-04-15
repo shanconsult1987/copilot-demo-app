@@ -7,8 +7,10 @@ Validates Bearer tokens on protected routes by:
  3. Caching the public keys in-process to avoid per-request network calls.
 """
 
+import logging
 import os
 import functools
+import threading
 from typing import Callable
 
 import requests
@@ -16,9 +18,12 @@ import jwt
 from jwt import PyJWKClient, InvalidTokenError
 from flask import request, jsonify
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
-# Configuration (read once at module load so tests can monkeypatch os.environ)
+# Configuration (read on every request so env-var changes take effect without
+# a restart; values are lightweight strings so the overhead is negligible)
 # ---------------------------------------------------------------------------
 
 def _get_config() -> dict:
@@ -47,7 +52,8 @@ def _build_jwks_client(jwks_uri: str) -> PyJWKClient:
     return PyJWKClient(jwks_uri, cache_keys=True)
 
 
-# Module-level cache; re-created if tenant/authority env vars change.
+# Module-level JWKS client cache protected by a lock for thread safety.
+_jwks_lock = threading.Lock()
 _jwks_client: PyJWKClient | None = None
 _jwks_uri_used: str | None = None
 
@@ -56,10 +62,11 @@ def _get_jwks_client() -> PyJWKClient:
     global _jwks_client, _jwks_uri_used  # noqa: PLW0603
     cfg = _get_config()
     uri = cfg["jwks_uri"]
-    if _jwks_client is None or uri != _jwks_uri_used:
-        _jwks_client = _build_jwks_client(uri)
-        _jwks_uri_used = uri
-    return _jwks_client
+    with _jwks_lock:
+        if _jwks_client is None or uri != _jwks_uri_used:
+            _jwks_client = _build_jwks_client(uri)
+            _jwks_uri_used = uri
+        return _jwks_client
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +95,7 @@ def require_auth(f: Callable) -> Callable:
 
         if not cfg["tenant_id"] or not cfg["client_id"]:
             # Auth is mis-configured – fail closed.
+            logger.error("Azure AD auth is not configured: AZURE_TENANT_ID or AZURE_CLIENT_ID is missing")
             return jsonify({"error": "Authentication not configured"}), 500
 
         try:
@@ -95,6 +103,7 @@ def require_auth(f: Callable) -> Callable:
             signing_key = client.get_signing_key_from_jwt(token)
 
             # Try v2 issuer first; fall back to v1 for enterprise tenants.
+            last_error: InvalidTokenError | None = None
             for issuer in (cfg["issuer_v2"], cfg["issuer_v1"]):
                 try:
                     claims = jwt.decode(
@@ -110,13 +119,17 @@ def require_auth(f: Callable) -> Callable:
                         },
                         issuer=issuer,
                     )
+                    logger.debug("Token validated successfully with issuer %s", issuer)
                     break  # Validation succeeded.
-                except InvalidTokenError:
+                except InvalidTokenError as exc:
+                    last_error = exc
                     continue
             else:
                 # Both issuers failed.
+                logger.warning("Token validation failed for both issuers: %s", last_error)
                 return jsonify({"error": "Token validation failed"}), 401
-        except InvalidTokenError:
+        except InvalidTokenError as exc:
+            logger.warning("Token validation failed: %s", exc)
             return jsonify({"error": "Token validation failed"}), 401
 
         # Attach decoded claims to the request context for downstream use.
