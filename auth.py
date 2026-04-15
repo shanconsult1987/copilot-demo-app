@@ -94,39 +94,30 @@ def require_auth(f: Callable) -> Callable:
             client = _get_jwks_client()
             signing_key = client.get_signing_key_from_jwt(token)
 
-            claims = jwt.decode(
-                token,
-                signing_key.key,
-                algorithms=["RS256"],
-                audience=cfg["audience"],
-                options={
-                    "verify_exp": True,
-                    "verify_nbf": True,
-                    "verify_iss": True,
-                    "require": ["exp", "iss", "aud", "sub"],
-                },
-                issuer=cfg["issuer_v2"],
-            )
-        except InvalidTokenError as exc:
-            # Try v1 issuer as a fallback (some enterprise tenants still emit v1 tokens)
-            try:
-                client = _get_jwks_client()
-                signing_key = client.get_signing_key_from_jwt(token)
-                claims = jwt.decode(
-                    token,
-                    signing_key.key,
-                    algorithms=["RS256"],
-                    audience=cfg["audience"],
-                    options={
-                        "verify_exp": True,
-                        "verify_nbf": True,
-                        "verify_iss": True,
-                        "require": ["exp", "iss", "aud", "sub"],
-                    },
-                    issuer=cfg["issuer_v1"],
-                )
-            except InvalidTokenError:
-                return jsonify({"error": f"Token validation failed: {exc}"}), 401
+            # Try v2 issuer first; fall back to v1 for enterprise tenants.
+            for issuer in (cfg["issuer_v2"], cfg["issuer_v1"]):
+                try:
+                    claims = jwt.decode(
+                        token,
+                        signing_key.key,
+                        algorithms=["RS256"],
+                        audience=cfg["audience"],
+                        options={
+                            "verify_exp": True,
+                            "verify_nbf": True,
+                            "verify_iss": True,
+                            "require": ["exp", "iss", "aud", "sub"],
+                        },
+                        issuer=issuer,
+                    )
+                    break  # Validation succeeded.
+                except InvalidTokenError:
+                    continue
+            else:
+                # Both issuers failed.
+                return jsonify({"error": "Token validation failed"}), 401
+        except InvalidTokenError:
+            return jsonify({"error": "Token validation failed"}), 401
 
         # Attach decoded claims to the request context for downstream use.
         request.token_claims = claims  # type: ignore[attr-defined]
